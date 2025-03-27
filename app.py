@@ -4,11 +4,16 @@ import streamlit as st
 from databricks import sql
 from databricks.sdk.core import Config
 from databricks.sdk import WorkspaceClient
+import os
+from databricks.vector_search.client import VectorSearchClient
 from datetime import datetime
 from PIL import Image
+from dotenv import load_dotenv
+# Load environment variables from a .env file
+load_dotenv()
 
 # Configuration for Databricks connection
-cfg = Config(host="https://adb-984752964297111.11.azuredatabricks.net/")  # Set the DATABRICKS_HOST environment variable when running locally
+cfg = Config(host=os.environ["DATABRICKS_HOST"])  # Set the DATABRICKS_HOST environment variable when running locally
 
 try:
     # if running on Databricks, fetch user email
@@ -18,7 +23,7 @@ except:
     # if running locally, use a default user
     CURRENT_USER = "local_test_user"
 
-SQL_HTTP_PATH = "/sql/1.0/warehouses/148ccb90800933a1"
+SQL_HTTP_PATH = os.environ["SQL_WAREHOUSE"]
 
 # Table names for storing data
 DOC_REFERENCE_TABLE = "marcell.marine_planning.parsed_pdfs"
@@ -45,7 +50,7 @@ prompt_3_default = """
 You are an environmental policy expert. You are given summary lists of issues pertaining to impact of infrastructure development on marine life, which have been identified in separate documents. Create a summary list of coherent sentences from these issues, merging any similar or duplicate issues into one item in your final list, and including the species, any quantitative impacts if any, compensation measures if any, the location, and the source document and page of the information. Format your content as markdown, putting any locations, species, and quantities into bold, and creating hyperlinks from your document references from the title and URLs provided. Here is the text: \n\n
 """
 
-# Cached function to establish a connection to Databricks
+# Cached function to establish a connection to Databricks SQL
 @st.cache_resource
 def get_connection():
     return sql.connect(
@@ -53,6 +58,17 @@ def get_connection():
         http_path=SQL_HTTP_PATH,
         credentials_provider=lambda: cfg.authenticate,
     )
+
+# Cached function to establish a connection to Databricks Vector Search
+@st.cache_resource
+def connect_to_vs():
+    vsc = VectorSearchClient(
+        workspace_url=os.environ["DATABRICKS_HOST"],
+        service_principal_client_id=os.environ["SP_CLIENT_ID"],
+        service_principal_client_secret=os.environ["SP_CLIENT_SECRET"]
+    )
+
+    return vsc.get_index(endpoint_name=os.environ["VS_ENDPOINT_NAME"], index_name=os.environ["VS_INDEX_NAME"])
 
 # Function to execute a query and return results as a Pandas DataFrame
 def run_query(query: str, conn) -> pd.DataFrame:
@@ -75,6 +91,16 @@ def submit_feedback(run_id, user, feedback, rating, feedback_table, conn):
             VALUES ('{run_id}', '{user}', '{feedback}', {rating})
         """)
         return "Feedback submitted successfully."
+    
+# Function to query the vector database
+def query_vs_index(index, query_text, score_threshold=0.004):
+    results = index.similarity_search(
+        query_text=query_text,
+        columns=["date", "title", "pdf_url", "chunk_pages", "chunk_text"],
+        num_results=10
+    )
+
+    return pd.DataFrame(results['result']['data_array'], columns=["date", "title", "pdf_url", "chunk_pages", "chunk_text", "similarity_score"])
 
 # Function to create necessary tables in the database
 def create_tables(paragraph_table_name, document_table_name, project_table_name, conn):
@@ -227,6 +253,7 @@ titles = doc_reference_df["title"].tolist()
 
 # Main Streamlit app logic
 conn = get_connection()
+index = connect_to_vs()
 
 # Fetch available run IDs
 run_ids = fetch_run_ids(conn)
@@ -239,7 +266,11 @@ st.title("Marine Planning Document Summarisation")
 st.markdown("""
 This app summarises the impacts of infrastructure development on marine life. It uses AI models to extract relevant information from documents.
 """)
+st.markdown("---")
 st.markdown("## Instructions")
+st.text("Load a previous document summarisation run or run a new extraction process. If running a new extraction, select the documents to summarise and optionally edit the prompts for each summarisation stage.")
+st.text("Once the extraction process is complete, view the summarised results and provide feedback on the quality of the extraction.")
+st.text("After a satisfactory list of summarised results is obtained, you can search across the entire corpus for each topic.")
 
 # Add a dropdown to select a previous run or choose to run a new extraction
 selected_run_id = st.selectbox("Select a previous run or choose to run a new extraction", ["Run New Extraction"] + run_ids)
@@ -325,3 +356,17 @@ else:
                 st.info(result)
 
 
+st.markdown("---")
+st.markdown("## Search across the entire corpus")
+search_string=st.text_input("Search for a topic", "")
+
+if st.button("Search"):
+    df_results = query_vs_index(index, search_string, score_threshold=0.003).sort_values("date")
+
+    for i, row in df_results.iterrows():
+        st.markdown(f"### {row['title']}")
+        st.markdown(f"Published on: {row['date']}")
+        st.markdown(f"Pages: {row['chunk_pages']}")
+        st.markdown(f"> {row['chunk_text']}")
+        st.markdown(f"[PDF Link]({row['pdf_url'].replace(' ', '%20')})")
+        st.markdown("---")
